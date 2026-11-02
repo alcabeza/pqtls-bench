@@ -1,0 +1,373 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PQ-TLS demo environment (hybrid ECDH + ML-KEM): a private S3 bucket and an EC2
+  instance (SSM access, no inbound port) with OpenSSL 3.5, AWS CLI, Java 17 and
+  Maven to test post-quantum communications to S3.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+    Description: Instance size (OpenSSL compiles faster on t3.medium).
+  OpenSslVersion:
+    Type: String
+    Default: '3.5.0'
+    Description: OpenSSL version to build (>= 3.5 required for native ML-KEM).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------- Minimal network ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: pqtls-demo }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: pqtls-demo }]
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/26
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: pqtls-demo-public }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  SubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # No inbound traffic: access is only through SSM Session Manager.
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PQ-TLS demo - no ingress, open egress
+      VpcId: !Ref Vpc
+
+  # ---------- Demo S3 bucket ----------
+  DemoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags: [{ Key: Purpose, Value: pqtls-demo }]
+
+  DemoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DemoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DemoBucket.Arn
+              - !Sub '${DemoBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ---------- IAM ----------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DemoBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt DemoBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub '${DemoBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:ListAllMyBuckets
+                Resource: '*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------- Instance EC2 ----------
+  DemoInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref InstanceSecurityGroup]
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 16, VolumeType: gp3, Encrypted: true }
+      MetadataOptions:
+        HttpTokens: required
+      Tags: [{ Key: Name, Value: pqtls-demo }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > /var/log/pqdemo-setup.log 2>&1
+          set -x
+
+          # Demo variables
+          mkdir -p /opt/pqdemo
+          cat > /etc/pqdemo.env << 'EOF'
+          BUCKET=${DemoBucket}
+          REGION=${AWS::Region}
+          EOF
+
+          # Tools
+          dnf install -y gcc make perl tar gzip tcpdump java-17-amazon-corretto-headless maven
+          for p in perl-core perl-IPC-Cmd perl-Time-Piece perl-FindBin; do dnf install -y $p || true; done
+
+          # OpenSSL >= 3.5 (native ML-KEM), installed separately so the system one is untouched
+          cd /tmp
+          curl -fsSLO https://github.com/openssl/openssl/releases/download/openssl-${OpenSslVersion}/openssl-${OpenSslVersion}.tar.gz
+          tar xzf openssl-${OpenSslVersion}.tar.gz
+          cd openssl-${OpenSslVersion}
+          ./Configure --prefix=/opt/openssl35 --openssldir=/opt/openssl35/ssl
+          make -j"$(nproc)"
+          make install_sw
+          mkdir -p /opt/openssl35/ssl
+          ln -sf /etc/pki/tls/certs/ca-bundle.crt /opt/openssl35/ssl/cert.pem
+
+          cat > /usr/local/bin/openssl35 << 'EOF'
+          #!/bin/bash
+          export LD_LIBRARY_PATH=/opt/openssl35/lib64:/opt/openssl35/lib
+          exec /opt/openssl35/bin/openssl "$@"
+          EOF
+          chmod +x /usr/local/bin/openssl35
+
+          # Demo script: classic vs hybrid handshake + S3 round trip
+          cat > /usr/local/bin/pq-demo << 'EOF'
+          #!/bin/bash
+          source /etc/pqdemo.env
+          HOST=s3.$REGION.amazonaws.com
+          openssl35 version
+          for G in X25519 X25519MLKEM768; do
+            echo; echo "=== TLS 1.3 handshake with -groups $G ==="
+            echo | openssl35 s_client -connect $HOST:443 -servername $HOST -groups $G -tls1_3 2>&1 \
+              | grep -E "Negotiated TLS1.3 group|Protocol|Verification"
+          done
+          echo; echo "=== S3 round trip (AWS CLI) ==="
+          echo "pq-demo $(date -u +%FT%TZ)" > /tmp/pq-hello.txt
+          aws s3 cp /tmp/pq-hello.txt s3://$BUCKET/pq-hello.txt --region $REGION
+          aws s3 ls s3://$BUCKET/ --region $REGION
+          EOF
+          chmod +x /usr/local/bin/pq-demo
+
+          # Network capture: shows the hybrid key_share in the ClientHello
+          cat > /usr/local/bin/pq-capture << 'EOF'
+          #!/bin/bash
+          # Usage: sudo pq-capture   (then run pq-demo in a 2nd terminal, Ctrl+C to stop)
+          tcpdump -i any -w /tmp/pq-demo.pcap "tcp port 443"
+          echo "Capture: /tmp/pq-demo.pcap (copy it to the bucket to analyze in Wireshark)"
+          EOF
+          chmod +x /usr/local/bin/pq-capture
+
+          # ---- Embedded bench scripts (nothing to download) ----
+          mkdir -p /opt/pqdemo/bench
+          cat > /opt/pqdemo/bench/pq_handshake_bench.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """Compare classic TLS (X25519) vs hybrid post-quantum TLS (X25519MLKEM768) handshakes to S3."""
+          import argparse, re, shutil, statistics, subprocess, time
+
+          OPENSSL = shutil.which("openssl35") or "openssl"  # OpenSSL >= 3.5 required for ML-KEM
+          GROUPS = {"classic (X25519)": "X25519", "hybrid PQ (X25519MLKEM768)": "X25519MLKEM768"}
+
+
+          def handshake(host, group):
+              cmd = [OPENSSL, "s_client", "-connect", f"{host}:443", "-servername", host,
+                     "-groups", group, "-tls1_3"]
+              t0 = time.perf_counter()
+              try:
+                  r = subprocess.run(cmd, input=b"", capture_output=True, timeout=15)
+              except subprocess.TimeoutExpired:
+                  return None, None
+              ms = (time.perf_counter() - t0) * 1000
+              txt = (r.stdout + r.stderr).decode(errors="ignore")
+              m = re.search(r"(?:Negotiated TLS1\.3 group|Server Temp Key):\s*([^\s,]+)", txt)
+              return (ms, m.group(1) if m else None) if r.returncode == 0 else (None, None)
+
+
+          def pctl(v, p):
+              s = sorted(v)
+              return s[min(len(s) - 1, round(p / 100 * (len(s) - 1)))]
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--region", default="eu-west-3")
+              ap.add_argument("--host")
+              ap.add_argument("--runs", type=int, default=30)
+              a = ap.parse_args()
+              host = a.host or f"s3.{a.region}.amazonaws.com"
+              print(subprocess.run([OPENSSL, "version"], capture_output=True, text=True).stdout.strip())
+              print(f"Endpoint: {host} | {a.runs} handshakes per mode\n")
+              res = []
+              for label, g in GROUPS.items():
+                  handshake(host, g)  # warm-up
+                  times, neg = [], set()
+                  for _ in range(a.runs):
+                      ms, n = handshake(host, g)
+                      if ms is not None:
+                          times.append(ms)
+                          neg.add(n)
+                  res.append(times)
+                  if not times:
+                      print(f"{label:30s} FAILED (group not supported, or blocked on the network?)")
+                      continue
+                  print(f"{label:30s} median {statistics.median(times):7.1f} ms | p95 {pctl(times, 95):7.1f} ms"
+                        f" | min {min(times):7.1f} | max {max(times):7.1f}")
+                  print(f"{'':30s} negotiated group: {', '.join(map(str, neg))}")
+              if all(res):
+                  print(f"\nMedian PQ-TLS overhead: {statistics.median(res[1]) - statistics.median(res[0]):+.1f} ms")
+              print("(duration includes openssl process startup: only the gap between modes matters)")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          mkdir -p /opt/pqdemo/bench/java
+          cat > /opt/pqdemo/bench/java/pom.xml << 'XEOF'
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>demo</groupId><artifactId>pqtls-bench</artifactId><version>1.0</version>
+            <properties><maven.compiler.source>17</maven.compiler.source><maven.compiler.target>17</maven.compiler.target></properties>
+            <dependencies>
+              <dependency><groupId>software.amazon.awssdk</groupId><artifactId>s3</artifactId><version>2.30.22</version></dependency>
+              <dependency><groupId>software.amazon.awssdk</groupId><artifactId>aws-crt-client</artifactId><version>2.30.22</version></dependency>
+            </dependencies>
+            <build><plugins><plugin>
+              <groupId>org.codehaus.mojo</groupId><artifactId>exec-maven-plugin</artifactId><version>3.1.0</version>
+              <configuration><mainClass>PqTlsBench</mainClass></configuration>
+            </plugin></plugins></build>
+          </project>
+          XEOF
+          mkdir -p /opt/pqdemo/bench/java/src/main/java
+          cat > /opt/pqdemo/bench/java/src/main/java/PqTlsBench.java << 'JEOF'
+          import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
+          import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
+          import software.amazon.awssdk.regions.Region;
+          import software.amazon.awssdk.services.s3.S3AsyncClient;
+          import java.util.*;
+
+          /** Usage: PqTlsBench <bucket> [region] [runs]. Cold = new handshake for each measurement, warm = reused connection. */
+          public class PqTlsBench {
+              public static void main(String[] args) {
+                  String bucket = args[0];
+                  Region region = Region.of(args.length > 1 ? args[1] : "eu-west-3");
+                  int runs = args.length > 2 ? Integer.parseInt(args[2]) : 30;
+                  for (boolean pq : new boolean[]{false, true}) {
+                      List<Double> cold = new ArrayList<>(), warm = new ArrayList<>();
+                      for (int i = 0; i < runs; i++) {
+                          try (SdkAsyncHttpClient h = http(pq); S3AsyncClient s3 = client(h, region)) {
+                              long t0 = System.nanoTime();
+                              s3.headBucket(b -> b.bucket(bucket)).join();
+                              cold.add((System.nanoTime() - t0) / 1e6);
+                          }
+                      }
+                      try (SdkAsyncHttpClient h = http(pq); S3AsyncClient s3 = client(h, region)) {
+                          s3.headBucket(b -> b.bucket(bucket)).join();
+                          for (int i = 0; i < runs; i++) {
+                              long t0 = System.nanoTime();
+                              s3.headBucket(b -> b.bucket(bucket)).join();
+                              warm.add((System.nanoTime() - t0) / 1e6);
+                          }
+                      }
+                      System.out.printf("%-22s cold: med %6.1f ms p95 %6.1f ms | warm: med %6.1f ms p95 %6.1f ms%n",
+                          pq ? "PQ-TLS (ECDH+ML-KEM)" : "Classic TLS", p(cold, 50), p(cold, 95), p(warm, 50), p(warm, 95));
+                  }
+              }
+              // Since SDK 2.35.11 PQ-TLS is on by default: we force false to get a classic baseline.
+              static SdkAsyncHttpClient http(boolean pq) { return AwsCrtAsyncHttpClient.builder().postQuantumTlsEnabled(pq).build(); }
+              static S3AsyncClient client(SdkAsyncHttpClient h, Region r) { return S3AsyncClient.builder().region(r).httpClient(h).build(); }
+              static double p(List<Double> v, int pc) { List<Double> s = new ArrayList<>(v); Collections.sort(s); return s.get(Math.min(s.size() - 1, (int) Math.round(pc / 100.0 * (s.size() - 1)))); }
+          }
+          JEOF
+
+          cat > /usr/local/bin/pq-bench << 'EOF'
+          #!/bin/bash
+          source /etc/pqdemo.env
+          exec python3 /opt/pqdemo/bench/pq_handshake_bench.py --region $REGION "$@"
+          EOF
+          cat > /usr/local/bin/pq-java-bench << 'EOF'
+          #!/bin/bash
+          # Usage: pq-java-bench [runs]   (default 30)
+          source /etc/pqdemo.env
+          cd /opt/pqdemo/bench/java
+          exec mvn -q -Dmaven.repo.local=/opt/pqdemo/m2 compile exec:java -Dexec.args="$BUCKET $REGION ${!1:-30}"
+          EOF
+          chmod +x /usr/local/bin/pq-bench /usr/local/bin/pq-java-bench
+
+          # Warm up Maven (downloads the SDK + CRT once and for all)
+          (cd /opt/pqdemo/bench/java && mvn -q -Dmaven.repo.local=/opt/pqdemo/m2 dependency:go-offline compile) || true
+          chmod -R a+rwX /opt/pqdemo
+
+          touch /opt/pqdemo/READY
+
+Outputs:
+  BucketName:
+    Description: Demo S3 bucket
+    Value: !Ref DemoBucket
+  InstanceId:
+    Description: Demo EC2 instance
+    Value: !Ref DemoInstance
+  ConnectCommand:
+    Description: Open a session on the instance (requires the Session Manager plugin)
+    Value: !Sub 'aws ssm start-session --target ${DemoInstance} --region ${AWS::Region}'
+  ReadyCheck:
+    Description: Check that setup is finished (10-15 min), then run pq-demo, pq-bench, pq-java-bench
+    Value: 'ls /opt/pqdemo/READY && pq-demo'
